@@ -5,6 +5,7 @@ import qrcode
 import os
 import sys
 import threading
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -26,25 +27,41 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ================== КОНФИГУРАЦИЯ ДЛЯ PYTHONANYWHERE ==================
-import os
+# ================== КОНФИГУРАЦИЯ ДЛЯ RENDER ==================
+# Добавляем текущую директорию в путь Python
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Автоматическое определение пути на PythonAnywhere
-if 'PYTHONANYWHERE_DOMAIN' in os.environ:
+# Автоматическое определение пути
+if 'RENDER' in os.environ:
+    # Мы на Render
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DB_NAME = os.path.join(BASE_DIR, 'evotor_loyalty.db')
+    WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost')}"
+    IS_RENDER = True
+    print(f"✅ Режим: RENDER, URL: {WEBHOOK_URL}")
+elif 'PYTHONANYWHERE_DOMAIN' in os.environ:
     # Мы на PythonAnywhere
     BASE_DIR = '/home/archicux/'
     DB_NAME = os.path.join(BASE_DIR, 'evotor_loyalty.db')
     WEBHOOK_URL = f"https://archicux.pythonanywhere.com"
+    IS_RENDER = False
+    print("✅ Режим: PythonAnywhere")
 else:
     # Локальная разработка
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DB_NAME = os.path.join(BASE_DIR, 'evotor_loyalty.db')
     WEBHOOK_URL = "http://localhost:8000"
+    IS_RENDER = False
+    print("✅ Режим: Локальный")
 
 # ================== НАСТРОЙКИ ==================
-# ВАЖНО: Замените на реальные данные!
-BOT_TOKEN = "8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0"  # Тестовый токен - замените на реальный!
-YOUR_TELEGRAM_ID = 945157249  # Замените на ваш реальный ID
+# Используем переменные окружения на Render
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0")
+YOUR_TELEGRAM_ID = int(os.environ.get('YOUR_TELEGRAM_ID', 945157249))
+
+# Проверка токена
+if not BOT_TOKEN or BOT_TOKEN == "8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0":
+    print("⚠️  ВНИМАНИЕ: Используется тестовый токен бота!")
 
 # Настройки лояльности
 LOYALTY_SETTINGS = {
@@ -462,47 +479,69 @@ async def health_check():
 async def evotor_webhook(request: Request):
     """Обработчик вебхука от Эвотор"""
     try:
-        data = await request.json()
+        # Пробуем разные форматы данных
+        try:
+            data = await request.json()
+        except:
+            # Иногда данные приходят как текст
+            body = await request.body()
+            data = json.loads(body.decode())
+        
         logger.info(f"Получен вебхук: {data}")
-
-        receipt = data.get("document", {})
-        total = receipt.get("total")
-        extra = receipt.get("extra", {})
-        qr_code = extra.get("clientCode")  # Формат: XXX-XXX
-
+        
+        # Разные форматы данных от Эвотор
+        receipt = data.get("document") or data.get("receipt") or data
+        
+        # Ищем total в разных местах
+        total = receipt.get("total") or receipt.get("sum") or receipt.get("amount")
+        
+        # Ищем QR код
+        extra = receipt.get("extra") or receipt.get("additional") or {}
+        qr_code = extra.get("clientCode") or extra.get("qrCode") or data.get("clientCode")
+        
+        if not qr_code:
+            # Пробуем найти в items или других полях
+            qr_code = receipt.get("clientCode") or data.get("clientCode")
+        
         if not qr_code or not total:
             logger.warning(f"Нет QR кода или суммы: qr_code={qr_code}, total={total}")
             return {"status": "ignored", "message": "Missing QR code or total"}
-
-        result = db.add_purchase_by_qr(qr_code, float(total))
+        
+        # Конвертируем в float
+        try:
+            total_float = float(total)
+        except:
+            return {"status": "error", "message": "Invalid total format"}
+        
+        result = db.add_purchase_by_qr(qr_code, total_float)
         if not result:
             logger.warning(f"Пользователь не найден: QR={qr_code}")
             return {"status": "not_found", "message": "Client not found"}
-
+        
         telegram_id, earned, balance = result
-
+        
         # Отправляем уведомление пользователю через бота
-        try:
-            if application and hasattr(application, 'bot'):
+        if application and hasattr(application, 'bot'):
+            try:
                 await application.bot.send_message(
                     chat_id=telegram_id,
-                    text=f"🧾 Покупка: {total} ₽\n"
+                    text=f"🧾 Покупка: {total_float} ₽\n"
                          f"🎁 Начислено: {earned} баллов\n"
                          f"💰 Баланс: {balance}"
                 )
                 logger.info(f"Уведомление отправлено пользователю {telegram_id}")
-        except Exception as e:
-            logger.error(f"Ошибка отправки уведомления: {e}")
-
+            except Exception as e:
+                logger.error(f"Ошибка отправки уведомления: {e}")
+        
         return {
             "status": "ok",
             "points": earned,
             "balance": balance,
             "message": "Points added successfully"
         }
-
+        
     except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}")
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
 
@@ -1311,6 +1350,21 @@ def main():
     print("=" * 60)
     print("🤖 СИСТЕМА ЛОЯЛЬНОСТИ ЭВОТОР")
     print("=" * 60)
+    print(f"Python версия: {sys.version}")
+    print(f"Токен бота: {'Установлен' if BOT_TOKEN and BOT_TOKEN != '8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0' else 'ТЕСТОВЫЙ'}")
+    print(f"Папка: {BASE_DIR}")
+    print(f"База данных: {DB_NAME}")
+    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    
+    # Проверяем существование requirements.txt
+    req_file = os.path.join(BASE_DIR, 'requirements.txt')
+    if os.path.exists(req_file):
+        print(f"✅ requirements.txt найден: {req_file}")
+    else:
+        print(f"⚠️  requirements.txt не найден в: {req_file}")
+        print("Список файлов в папке:")
+        for file in os.listdir(BASE_DIR):
+            print(f"  - {file}")
 
     if BOT_TOKEN == "8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0":
         print("⚠️  ВНИМАНИЕ: Используется тестовый токен!")
@@ -1331,15 +1385,6 @@ def main():
         print(f"📊 Статистика: {stats['total_users']} пользователей, {stats['total_sales']:.2f} руб. оборот")
     except Exception as e:
         print(f"⚠️  Ошибка БД: {e}")
-
-    # Запускаем вебхук в отдельном потоке (только если не на PythonAnywhere)
-    if 'PYTHONANYWHERE_DOMAIN' not in os.environ:
-        print("🚀 Запуск вебхука на порту 8000...")
-        webhook_thread = threading.Thread(target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000), daemon=True)
-        webhook_thread.start()
-        print("✅ Вебхук запущен: http://localhost:8000")
-    else:
-        print("✅ PythonAnywhere: вебхук будет запущен автоматически")
 
     # Создаем Application для бота
     try:
@@ -1483,14 +1528,23 @@ def main():
     print("=" * 60)
 
     try:
-        if 'PYTHONANYWHERE_DOMAIN' in os.environ:
-            print("🐍 PythonAnywhere: Запуск бота в режиме polling...")
-            application.run_polling()
+        if IS_RENDER or 'PYTHONANYWHERE_DOMAIN' in os.environ:
+            print("🌐 Cloud режим: Запуск FastAPI сервера...")
+            # На Render запускаем uvicorn
+            port = int(os.environ.get("PORT", 10000))
+            uvicorn.run(app, host="0.0.0.0", port=port)
         else:
-            print("🚀 Локальный запуск: Запуск бота...")
+            print("🚀 Локальный запуск: Запуск бота в режиме polling...")
+            # Локально запускаем вебхук в отдельном потоке
+            webhook_thread = threading.Thread(
+                target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000),
+                daemon=True
+            )
+            webhook_thread.start()
+            print("✅ Вебхук запущен: http://localhost:8000")
             application.run_polling()
     except Exception as e:
-        print(f"❌ Ошибка запуска бота: {e}")
+        print(f"❌ Ошибка запуска: {e}")
         print("Проверьте токен и подключение к интернету")
 
 
