@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: evotor-loyalty-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: "8200085604:AAHyzg31wBdNHDRFxvSWz_wNkFzp9iRRBD0"
+      - key: YOUR_TELEGRAM_ID
+        value: "945157249"
+      - key: RENDER
+        value: "true"
